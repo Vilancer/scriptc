@@ -947,8 +947,8 @@ export interface TypeMapperCtx {
    * answered with the CONCRETE type the checker computed for the same
    * position of the call site's resolved signature. The checker keeps
    * these symbolic inside the body and has no instantiation API; the
-   * resolved signature already holds their evaluation. Null when the type
-   * has no harvested twin (see harvestResolvedTypes). */
+   * resolved signature already holds their evaluation. Consulted only after
+   * the ordinary mapping fails (mapViaSymbolicTwin); null without a twin. */
   resolveSymbolicTs?: (type: ts.Type) => ts.Type | null;
   /** GENERIC program classes (monomorphization by flow): the mapping of a
    * concrete instantiation reference (`Box<number>`) — the Lowerer
@@ -1119,7 +1119,7 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   const sensitivityAtEntry = contextResolutions;
   mapTypeDepth++;
   try {
-    const mapped = mapTypeInner(type, ctx);
+    const mapped = mapTypeInner(type, ctx) ?? mapViaSymbolicTwin(type, ctx);
     if (
       mapped !== null &&
       memoKey !== null &&
@@ -1133,6 +1133,26 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   } finally {
     mapTypeDepth--;
   }
+}
+
+/** The last resort inside a call-keyed generic instance: a symbolic type the
+ * ordinary path could not map (a mapped or conditional type over the
+ * instance's parameters) maps through its concrete twin from the call
+ * site's resolved signature. Only consulted after a failure, so every type
+ * the ordinary path maps keeps its mapping exactly. */
+function mapViaSymbolicTwin(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
+  if (resolvingSymbolicTwin || !ctx.resolveSymbolicTs) return null;
+  const twin = ctx.resolveSymbolicTs(type);
+  if (twin === null || twin === type) return null;
+  resolvingSymbolicTwin = true;
+  let mapped: IrType | null;
+  try {
+    mapped = mapType(twin, ctx);
+  } finally {
+    resolvingSymbolicTwin = false;
+  }
+  if (mapped) contextResolutions++;
+  return mapped;
 }
 
 /** Local class types need the enclosing specialization's registered layout.
@@ -1179,26 +1199,6 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (bound) {
       contextResolutions++;
       return bound;
-    }
-  }
-  // A hint, never a verdict: a twin harvested at a call site that itself
-  // sits in a generic body can still be symbolic in THAT body's parameters
-  // (`Decode<B>` for `Decode<T>`), so an unmapped twin falls through to the
-  // ordinary path instead of replacing a resolvable type.
-  if (!resolvingSymbolicTwin) {
-    const resolvedTwin = ctx.resolveSymbolicTs?.(type) ?? null;
-    if (resolvedTwin !== null && resolvedTwin !== type) {
-      resolvingSymbolicTwin = true;
-      let viaTwin: IrType | null;
-      try {
-        viaTwin = mapType(resolvedTwin, ctx);
-      } finally {
-        resolvingSymbolicTwin = false;
-      }
-      if (viaTwin) {
-        contextResolutions++;
-        return viaTwin;
-      }
     }
   }
   // Narrowed type parameters: `!== undefined` / `!== null` / truthiness on

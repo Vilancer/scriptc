@@ -1547,9 +1547,6 @@ export function jsFuncNameOf(node: ts.Node, lowerer?: Lowerer): string | null {
   return null;
 }
 
-/** TypeFormatFlags.InTypeAlias: print an alias by its structure. */
-const TYPE_FORMAT_IN_TYPE_ALIAS = 8388608;
-
 export class Lowerer {
   readonly frontendServices: FrontendServices | undefined;
   readonly checker: ts.TypeChecker;
@@ -1764,8 +1761,8 @@ export class Lowerer {
    * the body needs — indexed accesses (`T[K]` needs K's literal key) and
    * keyed record reads (`o[k]` where k's type is a literal-bound K). */
   typeParamTsBindings: Map<ts.Symbol, ts.Type> | null = null;
-  /** The current call-keyed generic instance's symbolic → concrete table
-   * (GenericInstance.tsResolved); null outside one. */
+  /** The current call-keyed generic instance's lazy symbolic → concrete
+   * table (GenericInstance.tsResolved); null outside one. */
   resolvedTypeTable: ResolvedTypeTable | null = null;
   /** Non-null while an IMPLICIT-ANY instance body lowers (npm-static JS;
    * see generic-functions.ts): bound param symbol →
@@ -6358,23 +6355,17 @@ export class Lowerer {
     return (sym && this.typeParamBindings.get(sym)) ?? null;
   };
 
+  /** Fallback for mapType inside a call-keyed generic instance: the
+   * concrete twin of a symbolic type the ordinary path could not map
+   * (ResolvedTypeTable). Inert outside one. */
+  readonly symbolicTypeResolver = (t: ts.Type): ts.Type | null =>
+    this.resolvedTypeTable?.lookup(t) ?? null;
+
   /** The ts-level twin of typeParamResolver: the bound CHECKER type of a
    * type parameter in the current instantiation (typeParamTsBindings), for
    * the resolutions where mapType's widening already dropped what the body
    * needs (indexed accesses over literal-bound keys). Inert outside
    * call-keyed generic instantiation. */
-  readonly symbolicTypeResolver = (t: ts.Type): ts.Type | null => {
-    const table = this.resolvedTypeTable;
-    if (!table) return null;
-    const hit = table.byType.get(t) ?? table.byText.get(this.checker.typeToString(t));
-    if (hit) return hit;
-    // A body-local alias (`type Value = { [K in keyof T]: … }`) prints as its
-    // name; its expanded spelling is what the signature's twin was keyed by.
-    if (t.getAliasSymbol() === undefined) return null;
-    const expanded = this.checker.typeToString(t, undefined, TYPE_FORMAT_IN_TYPE_ALIAS);
-    return table.byText.get(expanded) ?? null;
-  };
-
   readonly typeParamTsResolver = (t: ts.Type): ts.Type | null => {
     if (!this.typeParamTsBindings || !(t.flags & ts.TypeFlags.TypeParameter)) return null;
     const sym: ts.Symbol | undefined = t.getSymbol();
