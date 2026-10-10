@@ -96,6 +96,73 @@ export interface GenericFnInfo {
   implicitParams?: (ts.Symbol | null)[];
 }
 
+/** Symbolic → concrete checker types for one generic instance. */
+export interface ResolvedTypeTable {
+  byType: Map<ts.Type, ts.Type>;
+  byText: Map<string, ts.Type>;
+}
+
+const MAX_HARVEST_DEPTH = 8;
+
+/** Pair the declared signature's types with the resolved signature's,
+ * position by position: parameters, return, record members, call
+ * signatures, type arguments. Every declared type that differs from its
+ * resolved twin is recorded, so a symbolic mapped/conditional type the
+ * body mentions (`Schema<{ [K in keyof S]: Infer<S[K]> }>`, its `parse`
+ * member, that member's return) maps through the checker's own
+ * evaluation instead of failing as an unresolvable generic shape. */
+export function harvestResolvedTypes(
+  checker: ts.TypeChecker,
+  declared: ts.Signature,
+  resolved: ts.Signature,
+  outer: (type: ts.Type) => ts.Type | null,
+): ResolvedTypeTable {
+  const table: ResolvedTypeTable = { byType: new Map(), byText: new Map() };
+  const walk = (d: ts.Type, resolvedHere: ts.Type, depth: number): void => {
+    if (depth > MAX_HARVEST_DEPTH || d === resolvedHere || table.byType.has(d)) return;
+    // A call site inside another generic body resolves to types still
+    // symbolic in THAT body's parameters; the enclosing instance's own
+    // table (installed while its body lowers) turns them concrete.
+    const r = outer(resolvedHere) ?? resolvedHere;
+    if (d === r) return;
+    table.byType.set(d, r);
+    const text = checker.typeToString(d);
+    if (!table.byText.has(text)) table.byText.set(text, r);
+    const dSigs = checker.getCallSignatures(d);
+    const rSigs = checker.getCallSignatures(r);
+    if (dSigs.length === 1 && rSigs.length === 1) walkSignature(dSigs[0]!, rSigs[0]!, depth + 1);
+    for (const p of checker.getPropertiesOfType(d)) {
+      const rp = checker.getPropertyOfType(r, p.name);
+      if (rp) walk(checker.getTypeOfSymbol(p), checker.getTypeOfSymbol(rp), depth + 1);
+    }
+    if (d.isTypeReference() && r.isTypeReference()) {
+      const dArgs = checker.getTypeArguments(d);
+      const rArgs = checker.getTypeArguments(r);
+      if (dArgs.length === rArgs.length) dArgs.forEach((a, i) => walk(a, rArgs[i]!, depth + 1));
+    }
+    // Alias instantiations (`Decode<{ [K in keyof T]: … }>` over a union):
+    // the same alias on both sides pairs its arguments position by position.
+    const dAlias = d.getAliasSymbol();
+    if (dAlias !== undefined && dAlias === r.getAliasSymbol()) {
+      const dArgs = d.getAliasTypeArguments() ?? [];
+      const rArgs = r.getAliasTypeArguments() ?? [];
+      if (dArgs.length === rArgs.length) dArgs.forEach((a, i) => walk(a, rArgs[i]!, depth + 1));
+    }
+  };
+  const walkSignature = (d: ts.Signature, r: ts.Signature, depth: number): void => {
+    const dParams = d.getParameters();
+    const rParams = r.getParameters();
+    if (dParams.length === rParams.length) {
+      dParams.forEach((p, i) =>
+        walk(checker.getTypeOfSymbol(p), checker.getTypeOfSymbol(rParams[i]!), depth),
+      );
+    }
+    walk(checker.getReturnTypeOfSignature(d), checker.getReturnTypeOfSignature(r), depth);
+  };
+  walkSignature(declared, resolved, 0);
+  return table;
+}
+
 export interface GenericInstance {
   path: InstantiationPath;
   name: string;
@@ -113,6 +180,11 @@ export interface GenericInstance {
    * binding has already lost what the body needs — `T[K]` and `o[k]` reads
    * whose K is bound to one literal key (typeParamTsBindings). */
   tsBindings?: Map<ts.Symbol, ts.Type>;
+  /** Call-keyed instances: symbolic checker types of the DECLARED signature
+   * (by identity, and by rendered text for structurally identical
+   * spellings elsewhere in the body) → their concrete twins in the call
+   * site's resolved signature (harvestResolvedTypes). */
+  tsResolved?: ResolvedTypeTable;
   /** Rendered type arguments ("<number, string>") for diagnostics. */
   typeArgsText: string;
   /** Implicit instances only: param symbol → the call site's (widened)
@@ -317,10 +389,28 @@ export function genericCallInstance(
     return internGenericInstance(lowerer, expr, info, params, returnType, () => bindings, {
       extraKey: `@${litKey}`,
       tsBindings,
+      tsResolved: () => {
+        const declared = lowerer.checker.getSignatureFromDeclaration(info.decl);
+        return declared
+          ? harvestResolvedTypes(lowerer.checker, declared, rsig, lowerer.symbolicTypeResolver)
+          : undefined;
+      },
     });
   }
-  return internGenericInstance(lowerer, expr, info, params, returnType, (tsBindings) =>
-    lowerer.inferTypeParamBindings(expr, info, rsig, tsBindings),
+  const tsResolved = (): ResolvedTypeTable | undefined => {
+    const declared = lowerer.checker.getSignatureFromDeclaration(info.decl);
+    return declared
+      ? harvestResolvedTypes(lowerer.checker, declared, rsig, lowerer.symbolicTypeResolver)
+      : undefined;
+  };
+  return internGenericInstance(
+    lowerer,
+    expr,
+    info,
+    params,
+    returnType,
+    (tsBindings) => lowerer.inferTypeParamBindings(expr, info, rsig, tsBindings),
+    { tsResolved },
   );
 }
 
@@ -336,7 +426,11 @@ function internGenericInstance(
   params: ParamShape[],
   returnType: IrType,
   makeBindings: (tsBindings: Map<ts.Symbol, ts.Type>) => Map<ts.Symbol, IrType>,
-  opts?: { extraKey?: string; tsBindings?: Map<ts.Symbol, ts.Type> },
+  opts?: {
+    extraKey?: string;
+    tsBindings?: Map<ts.Symbol, ts.Type>;
+    tsResolved?: () => ResolvedTypeTable | undefined;
+  },
 ): GenericInstance {
   // keyof-constrained instantiations append their literal keys
   // (extraKey): the IR signature alone under-discriminates there — two
@@ -380,6 +474,8 @@ function internGenericInstance(
       tsBindings,
       typeArgsText,
     };
+    const tsResolved = opts?.tsResolved?.();
+    if (tsResolved) inst.tsResolved = tsResolved;
     info.instances.set(key, inst);
     lowerer.instantiationQueue.push({ info, inst });
   }
@@ -671,6 +767,8 @@ export function lowerGenericInstance(
   // so only the method instantiation's own map installs.
   const prevTsBindings = lowerer.typeParamTsBindings;
   lowerer.typeParamTsBindings = inst.tsBindings ?? null;
+  const prevTsResolved = lowerer.resolvedTypeTable;
+  lowerer.resolvedTypeTable = inst.tsResolved ?? null;
   // Implicit-any instances thread their param bindings through typeOf
   // (the checker reports `any` inside the body — there is no T for
   // mapType to substitute); see the implicit-monomorphization section.
@@ -814,6 +912,7 @@ export function lowerGenericInstance(
     lowerer.currentClass = prevClass;
     lowerer.typeParamBindings = prevBindings;
     lowerer.typeParamTsBindings = prevTsBindings;
+    lowerer.resolvedTypeTable = prevTsResolved;
     lowerer.implicitParamTypes = prevImplicit;
     lowerer.instantiationContext = prevContext;
     lowerer.localClassInstantiations.pop();

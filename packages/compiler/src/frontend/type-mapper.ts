@@ -942,6 +942,14 @@ export interface TypeMapperCtx {
    * only where literal identity matters — indexed accesses (`T[K]`) inside
    * generic bodies whose K is bound to a literal key. */
   resolveTypeParamTs?: TypeParamTsResolver;
+  /** Symbolic types inside a generic body (mapped and conditional types
+   * over the instance's type parameters: `{ [K in keyof S]: Infer<S[K]> }`)
+   * answered with the CONCRETE type the checker computed for the same
+   * position of the call site's resolved signature. The checker keeps
+   * these symbolic inside the body and has no instantiation API; the
+   * resolved signature already holds their evaluation. Null when the type
+   * has no harvested twin (see harvestResolvedTypes). */
+  resolveSymbolicTs?: (type: ts.Type) => ts.Type | null;
   /** GENERIC program classes (monomorphization by flow): the mapping of a
    * concrete instantiation reference (`Box<number>`) — the Lowerer
    * registers/reuses the instantiation (`Box%0`) and answers its object
@@ -1083,6 +1091,11 @@ let mapTypeDepth = 0;
  * stay fenced instead of interning a per-context-wrong shape). */
 let contextResolutions = 0;
 
+/** Set while mapType follows a resolveSymbolicTs twin: the twin is already
+ * the checker's concrete answer, so its own parts must not chase twins
+ * again (no ping-pong between two symbolic spellings). */
+let resolvingSymbolicTwin = false;
+
 export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (mapTypeDepth >= MAP_TYPE_MAX_DEPTH) return null;
   // These intrinsic domains cannot depend on generic bindings, declaration
@@ -1166,6 +1179,26 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (bound) {
       contextResolutions++;
       return bound;
+    }
+  }
+  // A hint, never a verdict: a twin harvested at a call site that itself
+  // sits in a generic body can still be symbolic in THAT body's parameters
+  // (`Decode<B>` for `Decode<T>`), so an unmapped twin falls through to the
+  // ordinary path instead of replacing a resolvable type.
+  if (!resolvingSymbolicTwin) {
+    const resolvedTwin = ctx.resolveSymbolicTs?.(type) ?? null;
+    if (resolvedTwin !== null && resolvedTwin !== type) {
+      resolvingSymbolicTwin = true;
+      let viaTwin: IrType | null;
+      try {
+        viaTwin = mapType(resolvedTwin, ctx);
+      } finally {
+        resolvingSymbolicTwin = false;
+      }
+      if (viaTwin) {
+        contextResolutions++;
+        return viaTwin;
+      }
     }
   }
   // Narrowed type parameters: `!== undefined` / `!== null` / truthiness on
