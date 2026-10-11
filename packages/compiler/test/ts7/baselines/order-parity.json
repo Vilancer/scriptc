@@ -15091,6 +15091,18 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/4411-generic-mapped-schema-inference.ts": {
+   "order": [
+    "<repo>/tests/corpus/4411-generic-mapped-schema-inference.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/4412-generic-twin-fallback-preserves.ts": {
+   "order": [
+    "<repo>/tests/corpus/4412-generic-twin-fallback-preserves.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/4431-exception-pending-contexts.ts": {
    "order": [
     "<repo>/tests/corpus/4431-exception-pending-contexts.ts"
