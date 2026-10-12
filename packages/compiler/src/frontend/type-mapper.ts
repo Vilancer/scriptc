@@ -1181,8 +1181,8 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
  * site's resolved signature. Only consulted after a failure, so every type
  * the ordinary path maps keeps its mapping exactly. */
 function mapViaSymbolicTwin(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
-  if (resolvingSymbolicTwin || !ctx.resolveSymbolicTs) return null;
-  const twin = ctx.resolveSymbolicTs(type);
+  if (resolvingSymbolicTwin) return null;
+  const twin = ctx.resolveSymbolicTs?.(type) ?? null;
   if (twin === null || twin === type) return null;
   resolvingSymbolicTwin = true;
   let mapped: IrType | null;
